@@ -51,6 +51,7 @@ from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
+    enforce_history_budget,
     extract_persisted_path,
 )
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
@@ -1142,11 +1143,20 @@ def _persist_multimodal_text_parts(result: dict, tool_name: str, tool_call_id: s
 
 
 def _finalize_tool_batch(agent, messages: list, effective_task_id: str, num_tools: int, budget: BudgetConfig) -> None:
-    """Per-turn aggregate budget enforcement, then /steer injection — in that order, so the
-    steer marker is never truncated/discarded when enforcement replaces a result."""
+    """Per-turn aggregate budget enforcement, then session-history budget, then /steer
+    injection — in that order, so the steer marker is never truncated/discarded when
+    enforcement replaces a result.
+
+    ``enforce_turn_budget`` bounds only the current batch (``messages[-num_tools:]``);
+    ``enforce_history_budget`` additionally bounds ACCUMULATED tool-result chars across the
+    whole session so long autonomous/cron runs cannot grow inspection-sensitive model-visible
+    history without bound (Qwen InternalError.Algo.DataInspectionFailed after 32 clean calls).
+    It compacts oldest results to artifact references and protects the most recent ones, so
+    the fresh batch's content survives for immediate use."""
     if num_tools <= 0:
         return
     enforce_turn_budget(messages[-num_tools:], env=get_active_env(effective_task_id), config=budget)
+    enforce_history_budget(messages, env=get_active_env(effective_task_id), config=budget)
     agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
 

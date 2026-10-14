@@ -11,13 +11,16 @@ from tools.budget_config import (
 from tools.tool_result_storage import (
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
+    HISTORY_COMPACT_TAG,
     STORAGE_DIR,
     _build_persisted_message,
     _resolve_storage_dir,
     _safe_result_filename,
     _write_to_sandbox,
     cleanup_spillover_cache,
+    enforce_history_budget,
     enforce_turn_budget,
+    extract_persisted_path,
     generate_preview,
     get_spillover_dir,
     maybe_persist_tool_result,
@@ -348,6 +351,111 @@ class TestEnforceTurnBudget:
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
 
+
+# ── enforce_history_budget (Layer 4) ─────────────────────────────────
+
+class TestEnforceHistoryBudget:
+    """Accumulated-session bound: many individually-small tool results across many
+    model calls must not grow model-visible history without limit.
+
+    Regression for the Qwen InternalError.Algo.DataInspectionFailed failure in cron
+    job 73c94baea4f7: 46 tool results (~95K chars total, avg ~2K each, ZERO per-result
+    spills) accumulated over 32 successful model calls until the whole request was
+    inspection-rejected.  Per-result (L2) and per-batch (L3) budgets each passed;
+    only the accumulated total was the problem.
+    """
+
+    def _msg(self, tool_call_id, content):
+        return {"role": "tool", "name": "terminal", "tool_name": "terminal",
+                "tool_call_id": tool_call_id, "content": content}
+
+    def test_under_budget_untouched(self):
+        msgs = [self._msg(f"t{i}", "small " * 10) for i in range(5)]
+        result = enforce_history_budget(msgs, env=None,
+                                        config=BudgetConfig(history_budget=60_000))
+        assert all(HISTORY_COMPACT_TAG not in m["content"] for m in result)
+
+    def test_many_small_results_accumulating_across_model_calls(self, tmp_path, monkeypatch):
+        """THE regression test: 32 model calls x batches of individually-small results
+        (every one under every per-result AND per-turn threshold) must still keep
+        accumulated model-visible tool chars bounded, with raw output preserved."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = BudgetConfig(history_budget=20_000, history_recent_protect=4,
+                              turn_budget=200_000)
+        messages: list[dict] = []
+        raw_by_id: dict[str, str] = {}
+        # Mirror the cron failure shape: ~2K-char results, 2 per model call, 32 calls.
+        for call in range(32):
+            messages.append({"role": "assistant", "content": f"step {call}"
+                             , "tool_calls": [{"id": f"c{call}a"}, {"id": f"c{call}b"}]})
+            for suffix in ("a", "b"):
+                tid = f"c{call}{suffix}"
+                raw = f"result-{tid}\n" + ("r" * 2_000)
+                raw_by_id[tid] = raw
+                messages.append(self._msg(tid, raw))
+            # What _finalize_tool_batch does after every batch:
+            enforce_turn_budget(messages[-2:], env=None, config=config)
+            enforce_history_budget(messages, env=None, config=config)
+            visible = sum(len(m["content"]) for m in messages if m.get("role") == "tool")
+            # Bound: budget + protected-recent allowance (4 x ~2K) — never the full 131K.
+            assert visible <= config.history_budget + 4 * 2_100, f"call {call}: {visible}"
+
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        compacted = [m for m in tool_msgs if HISTORY_COMPACT_TAG in m["content"]]
+        assert len(compacted) > 40  # nearly all old results compacted
+        # The 4 most recent results stay fully inline (autonomous working context).
+        for m in tool_msgs[-4:]:
+            assert HISTORY_COMPACT_TAG not in m["content"]
+            assert raw_by_id[m["tool_call_id"]] == m["content"]
+        # Every compacted result points to an artifact holding its EXACT raw content.
+        spill_dir = tmp_path / "cache" / "spillover"
+        for m in compacted:
+            path = extract_persisted_path(m["content"])
+            assert path and (spill_dir / f"{m['tool_call_id']}.txt").exists()
+            assert (spill_dir / f"{m['tool_call_id']}.txt").read_text() == raw_by_id[m["tool_call_id"]]
+            assert len(m["content"]) < 600  # compact reference, not a preview dump
+
+    def test_recent_protect_count_respected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        msgs = [self._msg(f"t{i}", "x" * 5_000) for i in range(10)]
+        enforce_history_budget(msgs, env=None,
+                               config=BudgetConfig(history_budget=1_000, history_recent_protect=3))
+        # Oldest compacted; the last 3 protected even though still over budget.
+        assert all(HISTORY_COMPACT_TAG in m["content"] for m in msgs[:7])
+        assert all(HISTORY_COMPACT_TAG not in m["content"] for m in msgs[-3:])
+
+    def test_already_persisted_result_reuses_artifact_path(self, tmp_path, monkeypatch):
+        """A result already spilled by L2/L3 is compacted to a reference to the SAME
+        artifact — no duplicate raw rewrite."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        raw = "y" * 40_000  # > terminal's 32K override, so L2 actually persists it
+        persisted = maybe_persist_tool_result(
+            content=raw, tool_name="terminal", tool_use_id="t_pre",
+            env=None, config=BudgetConfig())
+        assert PERSISTED_OUTPUT_TAG in persisted
+        msgs = [self._msg("t_pre", persisted), self._msg("t_new", "fresh")]
+        enforce_history_budget(msgs, env=None,
+                               config=BudgetConfig(history_budget=100, history_recent_protect=1))
+        assert HISTORY_COMPACT_TAG in msgs[0]["content"]
+        assert extract_persisted_path(msgs[0]["content"]) == extract_persisted_path(persisted)
+        artifact = tmp_path / "cache" / "spillover" / "t_pre.txt"
+        assert artifact.read_text() == raw  # raw artifact untouched
+
+    def test_idempotent_on_compacted_history(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        msgs = [self._msg(f"t{i}", "z" * 5_000) for i in range(8)]
+        cfg = BudgetConfig(history_budget=1_000, history_recent_protect=2)
+        enforce_history_budget(msgs, env=None, config=cfg)
+        snapshot = [m["content"] for m in msgs]
+        enforce_history_budget(msgs, env=None, config=cfg)  # second pass must be a no-op
+        assert [m["content"] for m in msgs] == snapshot
+
+    def test_empty_and_non_tool_messages(self):
+        assert enforce_history_budget([], env=None) == []
+        msgs = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+        result = enforce_history_budget(msgs, env=None,
+                                        config=BudgetConfig(history_budget=1))
+        assert result[0]["content"] == "hi" and result[1]["content"] == "hello"
 
 # ── Per-tool threshold integration ────────────────────────────────────
 

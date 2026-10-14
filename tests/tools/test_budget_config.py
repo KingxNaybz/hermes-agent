@@ -240,6 +240,59 @@ class TestMcpPrefixThreshold:
         assert cfg.resolve_threshold("mcp_tool") == cfg.default_result_size
 
 
+# ---------------------------------------------------------------------------
+# History budget (Layer 4) — accumulated-session bound
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryBudget:
+    """history_budget / history_recent_protect defaults, config override, scaling."""
+
+    def test_defaults(self):
+        from tools.budget_config import (
+            DEFAULT_HISTORY_BUDGET_CHARS, DEFAULT_HISTORY_RECENT_PROTECT)
+        assert DEFAULT_BUDGET.history_budget == DEFAULT_HISTORY_BUDGET_CHARS == 60_000
+        assert DEFAULT_BUDGET.history_recent_protect == DEFAULT_HISTORY_RECENT_PROTECT == 6
+
+    def test_config_override_via_hermes_home(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  history_budget_chars: 40000\n  history_recent_protect: 10\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.history_budget == 40_000
+        assert cfg.history_recent_protect == 10
+
+    def test_invalid_values_fall_back_to_defaults(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  history_budget_chars: -5\n  history_recent_protect: abc\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        from tools.budget_config import (
+            DEFAULT_HISTORY_BUDGET_CHARS, DEFAULT_HISTORY_RECENT_PROTECT)
+        assert cfg.history_budget == DEFAULT_HISTORY_BUDGET_CHARS
+        assert cfg.history_recent_protect == DEFAULT_HISTORY_RECENT_PROTECT
+
+    def test_small_context_window_scales_history_budget_down(self, tmp_path, monkeypatch):
+        """A small-window model gets a proportionally smaller history budget, but
+        never below the floor."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(16_384)  # 65,536 window chars -> 10% = 6,553 < floor
+        from tools.budget_config import _MIN_HISTORY_BUDGET_CHARS
+        assert cfg.history_budget == _MIN_HISTORY_BUDGET_CHARS
+        big = budget_for_context_window(1_000_000)  # 4M chars -> 10% = 400K, capped at default
+        assert big.history_budget == 60_000
+
+    def test_history_budget_untouched_by_turn_budget_changes(self, tmp_path, monkeypatch):
+        """Configuring the turn budget must not silently alter the history bound."""
+        (tmp_path / "config.yaml").write_text("tool_budget:\n  turn_budget_chars: 30000\n")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.turn_budget == 30_000
+        assert cfg.history_budget == 60_000
+
+
 class TestInspectionSafeToolBudgets:
     def test_large_output_tools_have_bounded_defaults(self):
         assert DEFAULT_BUDGET.resolve_threshold("vision_analyze") == 12_000

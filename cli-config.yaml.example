@@ -804,6 +804,8 @@ compression:
 #   turn_budget_chars: 200000
 #   preview_size_chars: 1500
 #   mcp_result_size_chars: 20000
+#   history_budget_chars: 60000    # accumulated-session cap: oldest results
+#   history_recent_protect: 6      # compact to artifact refs, newest N stay inline
 #   per_tool_result_size_chars:
 #     vision_analyze: 12000
 #     browser_exec: 20000

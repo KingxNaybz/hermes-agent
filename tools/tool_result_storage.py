@@ -3,7 +3,10 @@ context overflow: (1) per-tool caps inside each tool; (2) ``maybe_persist_tool_r
 output over the tool's threshold is persisted and replaced by a preview + path; canonical home
 is ALWAYS host-side ``$HERMES_HOME/cache/spillover/{id}.txt`` (works for sessions that never
 ran a terminal), remote backends get the translated in-sandbox path (probed for readability)
-else a copy in the sandbox temp dir; (3) ``enforce_turn_budget``."""
+else a copy in the sandbox temp dir; (3) ``enforce_turn_budget`` — per-batch aggregate cap;
+(4) ``enforce_history_budget`` — accumulated-session cap that compacts OLDEST tool results to
+artifact references so a long autonomous run cannot grow inspection-sensitive model-visible
+history without bound (Qwen InternalError.Algo.DataInspectionFailed after 32 clean calls)."""
 
 import hashlib
 import logging
@@ -238,10 +241,12 @@ _PERSISTED_PATH_RE = re.compile(r"^Full output saved to: (.+)$", re.MULTILINE)
 
 
 def extract_persisted_path(content: str) -> str | None:
-    """File path from a <persisted-output> block, or None (lets the result-reference stubbing
-    guard in agent/tool_guardrails.py carry the spillover path instead of leaving it dangling)."""
+    """File path from a <persisted-output> or <history-compacted> block, or None (lets the
+    result-reference stubbing guard in agent/tool_guardrails.py carry the spillover path
+    instead of leaving it dangling)."""
     match = (_PERSISTED_PATH_RE.search(content)
-             if isinstance(content, str) and PERSISTED_OUTPUT_TAG in content else None)
+             if isinstance(content, str)
+             and (PERSISTED_OUTPUT_TAG in content or HISTORY_COMPACT_TAG in content) else None)
     return match.group(1).strip() if match else None
 
 
@@ -310,6 +315,120 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             logger.info("Budget enforcement: persisted tool result %s (%d chars)",
                         tool_use_id, size)
     return tool_messages
+
+
+# ---- Layer 4: accumulated-history budget ----
+
+HISTORY_COMPACT_TAG = "<history-compacted>"
+HISTORY_COMPACT_CLOSING_TAG = "</history-compacted>"
+
+
+def _build_history_compact_message(original_size: int, file_path: str) -> str:
+    """Compact replacement for an OLD tool result: artifact reference only, no preview.
+
+    Keeps the ``Full output saved to:`` line so ``extract_persisted_path`` (and the
+    result-reference guard) keep working on compacted history."""
+    return (
+        f"{HISTORY_COMPACT_TAG}\n"
+        f"This earlier tool result ({original_size:,} characters) was compacted to keep\n"
+        "accumulated session context within provider inspection limits.\n"
+        f"Full output saved to: {file_path}\n"
+        "Use the read_file tool with offset and limit to access specific sections if the\n"
+        "original data is needed again; it is preserved in full on disk.\n"
+        f"{HISTORY_COMPACT_CLOSING_TAG}"
+    )
+
+
+def _compact_history_result(content: str, tool_use_id: str, env, config: BudgetConfig) -> str | None:
+    """Replace one OLD tool result with a compact artifact reference, preserving raw output.
+
+    Already-persisted results reference an existing artifact — reuse that path instead of
+    rewriting.  Non-persisted results are spilled through ``maybe_persist_tool_result``
+    (threshold=0) first, so raw content is never lost; if persistence is impossible, its
+    inline-truncated fallback is used as the compact form.  Returns None when there is
+    nothing to do (already compacted).
+    """
+    if HISTORY_COMPACT_TAG in content:
+        return None
+    existing_path = extract_persisted_path(content)
+    if existing_path is not None:
+        return _build_history_compact_message(len(content), existing_path)
+    persisted = maybe_persist_tool_result(
+        content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
+        env=env, config=config, threshold=0)
+    if persisted == content:
+        return None
+    path = extract_persisted_path(persisted)
+    if path is not None:
+        return _build_history_compact_message(len(content), path)
+    return persisted  # inline-truncation fallback (no writable artifact location)
+
+
+def _shrink_history_stub(content: str) -> str | None:
+    """Shrink an already-compacted <history-compacted> reference to its minimal stub.
+
+    Full references are ~350 chars; across hundreds of tool results they would themselves
+    re-accumulate.  The stub keeps the ``Full output saved to:`` line so
+    ``extract_persisted_path`` (and the guardrails result-reference carry) still resolve the
+    artifact.  Returns None when the content is not a shrinkable reference."""
+    path = extract_persisted_path(content)
+    if path is None:
+        return None
+    stub = (f"{HISTORY_COMPACT_TAG}\n"
+            "Earlier result compacted.\n"
+            f"Full output saved to: {path}\n"
+            f"{HISTORY_COMPACT_CLOSING_TAG}")
+    return stub if len(stub) < len(content) else None
+
+
+def enforce_history_budget(messages: list[dict], env=None,
+                           config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
+    """Layer 4: bound ACCUMULATED model-visible tool-result chars across the whole session.
+
+    ``enforce_turn_budget`` only sees the current batch (``messages[-num_tools:]``), so a long
+    autonomous/cron run can accumulate tens of thousands of individually-compliant chars and
+    trip provider content inspection on the aggregate request (observed as Qwen
+    InternalError.Algo.DataInspectionFailed after 32 successful calls, 46 tool results,
+    ~95K chars, zero per-result spills).
+
+    Strategy: while total tool-result content exceeds ``config.history_budget``, compact the
+    OLDEST non-compacted results into artifact references (~300 chars each, raw preserved on
+    disk), protecting the ``config.history_recent_protect`` most recent tool results so the
+    model keeps immediate working context.  If the references themselves keep the total over
+    budget (a very long session), a second pass shrinks them to minimal stubs that still
+    resolve via ``extract_persisted_path``.  Mutates in place and returns the list.
+    """
+    tool_indices = [i for i, m in enumerate(messages)
+                    if isinstance(m, dict) and m.get("role") == "tool"
+                    and isinstance(m.get("content"), str)]
+    if not tool_indices:
+        return messages
+    total = sum(len(messages[i]["content"]) for i in tool_indices)
+    if total <= config.history_budget:
+        return messages
+    protect_from = len(tool_indices) - max(0, config.history_recent_protect)
+    for pos, idx in enumerate(tool_indices):
+        if total <= config.history_budget or pos >= protect_from:
+            break
+        content = messages[idx]["content"]
+        tool_use_id = messages[idx].get("tool_call_id", f"history_{idx}")
+        replacement = _compact_history_result(content, tool_use_id, env, config)
+        if replacement is not None:
+            total += len(replacement) - len(content)
+            messages[idx]["content"] = replacement
+            logger.info("History budget: compacted tool result %s (%d chars -> %d)",
+                        tool_use_id, len(content), len(replacement))
+    if total > config.history_budget:
+        # Second pass: shrink the compact references themselves (they carry no raw data,
+        # only the artifact path) until the accumulated history fits the budget.
+        for pos, idx in enumerate(tool_indices):
+            if total <= config.history_budget or pos >= protect_from:
+                break
+            stub = _shrink_history_stub(messages[idx]["content"])
+            if stub is not None:
+                total += len(stub) - len(messages[idx]["content"])
+                messages[idx]["content"] = stub
+    return messages
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

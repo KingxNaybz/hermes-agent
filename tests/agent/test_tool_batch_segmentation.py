@@ -741,3 +741,60 @@ class TestPathCanonicalization:
         assert _paths_overlap(upper, lower), (
             "Case-insensitive aliases must overlap on Windows"
         )
+
+
+class TestHistoryBudgetIntegration:
+    """Layer-4 regression through the real executor: many model calls, each with
+    individually-small tool results, must not accumulate unbounded model-visible
+    history (Qwen InternalError.Algo.DataInspectionFailed after 32 clean calls,
+    cron job 73c94baea4f7).
+    """
+
+    def test_small_results_across_many_model_calls_stay_bounded(self, agent, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        messages = []
+        budget = BudgetConfig(
+            default_result_size=100_000,   # L2 per-result: never trips (results ~3K)
+            turn_budget=200_000,           # L3 per-batch: never trips
+            history_budget=10_000,         # L4 accumulated: the bound under test
+            history_recent_protect=4,
+            preview_size=500,
+        )
+        result_size = 3_000
+        raw_by_id = {}
+
+        def fake_handle(name, args, task_id, **kwargs):
+            payload = f"out-{kwargs['tool_call_id']}\n" + "d" * result_size
+            raw_by_id[kwargs["tool_call_id"]] = payload
+            return payload
+
+        with (
+            patch("model_tools.handle_function_call", side_effect=fake_handle),
+            patch("agent.tool_executor._budget_for_agent", return_value=budget),
+        ):
+            # 12 simulated model calls x 2 tool calls each = 24 results (~74K raw).
+            for call in range(12):
+                calls = [_tc("terminal", '{"command":"echo x"}', call_id=f"h{call}{s}")
+                         for s in ("a", "b")]
+                msg = SimpleNamespace(content="", tool_calls=calls)
+                agent._execute_tool_calls(msg, messages, "task-1")
+                visible = sum(len(m["content"]) for m in messages
+                              if m.get("role") == "tool" and isinstance(m.get("content"), str))
+                assert visible <= budget.history_budget + 4 * (result_size + 200), (
+                    f"model call {call}: accumulated {visible} chars unbounded")
+
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        assert len(tool_msgs) == 24
+        # Oldest results compacted to artifact references; raw preserved on disk.
+        compacted = [m for m in tool_msgs if "<history-compacted>" in m["content"]
+                     or PERSISTED_OUTPUT_TAG in m["content"]]
+        assert len(compacted) >= 16
+        spill_dir = tmp_path / "cache" / "spillover"
+        for m in compacted:
+            artifact = spill_dir / f"{m['tool_call_id']}.txt"
+            assert artifact.exists()
+            assert artifact.read_text() == raw_by_id[m["tool_call_id"]]
+        # Most recent results remain inline for autonomous continuation.
+        recent = [m for m in tool_msgs if "<history-compacted>" not in m["content"]
+                  and PERSISTED_OUTPUT_TAG not in m["content"]]
+        assert len(recent) >= 2

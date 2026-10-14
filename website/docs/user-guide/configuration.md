@@ -916,6 +916,8 @@ Separately from truncation, oversized tool *results* are spilled to disk rather 
 
 Inspection-sensitive and routinely high-volume tools spill sooner: `vision_analyze` at **12,000 chars**; `session_search`, `hindsight_recall`, and `hindsight_reflect` at **16,000**; and `browser_exec`, `web_extract`, and `mcp_*` tools at **20,000**. Additional bounded defaults cover terminal/file searches, code execution, and delegated-task results. This prevents a single provider-sensitive result from contaminating the following model request while retaining the complete raw artifact on disk.
 
+A long autonomous or cron session can also fail provider content inspection on the **accumulated** history even when every individual result is compliant — many small tool results add up across dozens of model calls. An accumulated-session bound (`history_budget_chars`, default **60,000** chars, scaled down for small-context models) compacts the *oldest* tool results into artifact references (`<history-compacted>` blocks, raw output preserved in the spillover directory), while the most recent results (`history_recent_protect`, default **6**) stay fully inline so the agent keeps its immediate working context.
+
 All limits are configurable globally or per tool:
 
 ```yaml
@@ -924,6 +926,8 @@ tool_budget:
   turn_budget_chars: 200000
   preview_size_chars: 1500
   mcp_result_size_chars: 20000
+  history_budget_chars: 60000
+  history_recent_protect: 6
   per_tool_result_size_chars:
     vision_analyze: 12000
     browser_exec: 20000
