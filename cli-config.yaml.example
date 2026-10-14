@@ -794,14 +794,21 @@ compression:
 # Tool-result budget (optional)
 # =============================================================================
 # Controls when a large tool result is spilled to disk (full output saved to
-# $HERMES_HOME/cache/spillover, preview + path kept in context). MCP tool
-# results (tools named mcp_*) spill at a tighter 50,000-char threshold than
-# the generic 100K default: MCP servers routinely return un-paginated 20-50K
-# payloads that bloat context and slow every subsequent turn. Nothing is
-# lost — the full result is on disk and readable with read_file.
+# $HERMES_HOME/cache/spillover, preview + path kept in context). The generic
+# threshold is 100K; inspection-sensitive/high-volume tools have safer defaults
+# (for example vision 12K, session/memory 16K, browser/web and mcp_* 20K).
+# Nothing is lost — the full result is readable with read_file.
 #
 # tool_budget:
-#   mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+#   default_result_size_chars: 100000
+#   turn_budget_chars: 200000
+#   preview_size_chars: 1500
+#   mcp_result_size_chars: 20000
+#   per_tool_result_size_chars:
+#     vision_analyze: 12000
+#     browser_exec: 20000
+#     session_search: 16000
+#     hindsight_recall: 16000
 
 # =============================================================================
 # Anthropic prompt caching TTL

@@ -914,14 +914,24 @@ tool_output:
 
 Separately from truncation, oversized tool *results* are spilled to disk rather than cut: the full output is saved under `$HERMES_HOME/cache/spillover/` and the in-context content is replaced by a preview plus the saved file's path (readable with `read_file` using `offset`/`limit`, or processable with `execute_code`). The generic per-result spillover threshold is 100,000 chars, scaled down automatically for small-context models.
 
-MCP tool results (tools named `mcp_*`) spill at a tighter **50,000-char** default: MCP servers routinely return large un-paginated payloads (tool-discovery catalogs, batched executions) that would otherwise sit under the generic threshold and bloat context on every subsequent turn. Nothing is lost — the full result is preserved on disk. Override the threshold via:
+Inspection-sensitive and routinely high-volume tools spill sooner: `vision_analyze` at **12,000 chars**; `session_search`, `hindsight_recall`, and `hindsight_reflect` at **16,000**; and `browser_exec`, `web_extract`, and `mcp_*` tools at **20,000**. Additional bounded defaults cover terminal/file searches, code execution, and delegated-task results. This prevents a single provider-sensitive result from contaminating the following model request while retaining the complete raw artifact on disk.
+
+All limits are configurable globally or per tool:
 
 ```yaml
 tool_budget:
-  mcp_result_size_chars: 50000   # per-result spillover threshold for mcp_* tools
+  default_result_size_chars: 100000
+  turn_budget_chars: 200000
+  preview_size_chars: 1500
+  mcp_result_size_chars: 20000
+  per_tool_result_size_chars:
+    vision_analyze: 12000
+    browser_exec: 20000
+    session_search: 16000
+    hindsight_recall: 16000
 ```
 
-The MCP threshold is always capped at the (possibly context-scaled) generic per-result threshold, so raising it cannot exceed what the active model's window allows.
+Per-tool and MCP thresholds are always capped at the (possibly context-scaled) generic per-result threshold, so raising one cannot exceed what the active model's window allows. Invalid or non-positive values are ignored in favor of safe defaults.
 
 Hermes also flags **provider-side elision**: when an MCP or web tool result embeds its own truncation markers (`...N more items`, `"has_more": true`, "saved to sandbox" notes), a one-line notice is appended to the result warning that the visible data is incomplete and should be paged/fetched before treating any enumeration as complete.
 

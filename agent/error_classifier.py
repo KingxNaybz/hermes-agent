@@ -50,6 +50,7 @@ class FailoverReason(enum.Enum):
     model_not_found = "model_not_found"  # 404 or invalid model — fallback to different model
     provider_policy_blocked = "provider_policy_blocked"  # Aggregator account data/privacy policy excluded the only endpoint
     content_policy_blocked = "content_policy_blocked"  # Provider safety filter rejected this prompt — deterministic per-request, don't retry unchanged
+    content_rejected = "content_rejected"      # Provider data inspection rejected this exact context — do not retry/fallback unchanged
     model_entitlement = "model_entitlement"  # This account cannot use the requested model — rotate credential (model-scoped), else fall back
     incomplete_response = "incomplete_response"  # Codex/Responses turn stuck emitting reasoning only (no answer, no tool call) after replay + nudge — hand to a different provider
     format_error = "format_error"        # 400 bad request — abort or strip + retry
@@ -459,6 +460,9 @@ _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
+# Data-inspection rejection is deterministic for the identical contaminated context.
+# In particular, do not route the same payload to an automatic parent fallback.
+_V_CONTENT_REJECTED = _v(_R.content_rejected, retryable=False, should_fallback=False, should_compress=False)
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
 _V_MODEL_ENTITLEMENT = _v(_R.model_entitlement, retryable=False, **_ROTATE_FALLBACK)
 _V_FORMAT_ERROR = _v(_R.format_error, **_ABORT_FALLBACK)
@@ -810,6 +814,26 @@ def _nous_welcome_tier(c: _Ctx) -> Optional[Verdict]:
     return _v(_R.format_error, retryable=False, should_fallback=True, error_context=ctx)
 
 
+_DATA_INSPECTION_REJECTION_PATTERNS = (
+    "internalerror.algo.datainspectionfailed",
+    "data_inspection_failed",
+    "datainspectionfailed",
+)
+
+
+def _data_inspection_rejection(c: _Ctx) -> Optional[Verdict]:
+    """Alibaba/Qwen content-inspection refusal.
+
+    DashScope returns this as HTTP 400 even though the request shape is valid.
+    It is content-dependent and deterministic for the unchanged request, so it
+    must beat generic 400/format handling and every retry/fallback path.
+    """
+    haystacks = (c.code, c.msg)
+    if any(pattern in text for pattern in _DATA_INSPECTION_REJECTION_PATTERNS for text in haystacks):
+        return _V_CONTENT_REJECTED
+    return None
+
+
 def _provider_special_cases(c: _Ctx) -> Optional[Verdict]:
     """Highest-priority provider-specific shapes that a status code would misroute."""
     msg, status = c.msg, c.status_code
@@ -941,7 +965,7 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
-    _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
+    _data_inspection_rejection, _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
 

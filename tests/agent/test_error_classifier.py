@@ -71,6 +71,7 @@ class TestFailoverReason:
             "reasoning_mandatory",
             "provider_policy_blocked",
             "content_policy_blocked",
+            "content_rejected",
             "model_entitlement",
             "incomplete_response",
             "thinking_signature", "long_context_tier",
@@ -2160,3 +2161,30 @@ class TestAuthErrorNamesOffRouteEndpoint:
         for base_url in ("", "https://api.anthropic.com/v1"):
             result = classify_api_error(e, provider="anthropic", model="claude", base_url=base_url)
             assert result.message == "API keys are not supported by this endpoint.", base_url
+
+
+class TestAlibabaDataInspectionRejected:
+    @pytest.mark.parametrize("body", [
+        {"code": "InternalError.Algo.DataInspectionFailed", "message": "Data inspection failed"},
+        {"error": {"code": "data_inspection_failed", "message": "request rejected"}},
+    ])
+    def test_classified_as_nonretryable_content_rejected(self, body):
+        error = MockAPIError("Error code: 400", status_code=400, body=body)
+        result = classify_api_error(error, provider="custom", model="qwen3-max")
+        assert result.reason is FailoverReason.content_rejected
+        assert result.retryable is False
+        assert result.should_fallback is False
+        assert result.should_compress is False
+        assert result.should_rotate_credential is False
+
+    def test_beats_large_session_malformed_request_path(self):
+        error = MockAPIError(
+            "InternalError.Algo.DataInspectionFailed", status_code=400,
+            body={"message": "data_inspection_failed"},
+        )
+        result = classify_api_error(
+            error, provider="custom", model="qwen3-max",
+            approx_tokens=19000, context_length=262144, num_messages=14,
+        )
+        assert result.reason is FailoverReason.content_rejected
+        assert result.reason is not FailoverReason.format_error

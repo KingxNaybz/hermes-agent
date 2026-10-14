@@ -138,7 +138,7 @@ class TestResolveThreshold:
         """
         mock_registry.get_max_result_size.return_value = 100_000
         cfg = BudgetConfig(default_result_size=30_000)
-        assert cfg.resolve_threshold("web_search") == 30_000
+        assert cfg.resolve_threshold("registered_tool") == 30_000
 
 
     @patch("tools.registry.registry")
@@ -146,7 +146,7 @@ class TestResolveThreshold:
         """Default budget keeps 100K registry tools at 100K (no behavior change)."""
         mock_registry.get_max_result_size.return_value = 100_000
         cfg = BudgetConfig()  # default_result_size == 100_000
-        assert cfg.resolve_threshold("web_search") == 100_000
+        assert cfg.resolve_threshold("registered_tool") == 100_000
 
 
 # ---------------------------------------------------------------------------
@@ -181,12 +181,12 @@ class TestBudgetForContextWindow:
 
 
 class TestMcpPrefixThreshold:
-    """mcp_* tools get the tighter 50K default, config-overridable."""
+    """mcp_* tools get the tighter 20K default, config-overridable."""
 
-    def test_default_mcp_threshold_is_50k(self):
+    def test_default_mcp_threshold_is_20k(self):
         from tools.budget_config import DEFAULT_MCP_RESULT_SIZE_CHARS
-        assert DEFAULT_MCP_RESULT_SIZE_CHARS == 50_000
-        assert DEFAULT_BUDGET.resolve_threshold("mcp_composio_search_tools") == 50_000
+        assert DEFAULT_MCP_RESULT_SIZE_CHARS == 20_000
+        assert DEFAULT_BUDGET.resolve_threshold("mcp_composio_search_tools") == 20_000
 
     def test_non_mcp_tools_keep_generic_default(self):
         assert DEFAULT_BUDGET.resolve_threshold("some_random_tool") == DEFAULT_RESULT_SIZE_CHARS
@@ -230,7 +230,7 @@ class TestMcpPrefixThreshold:
         (tmp_path / "config.yaml").write_text("tool_budget: not-a-mapping\n")
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cfg = budget_for_context_window(None)
-        assert cfg.resolve_threshold("mcp_x_y") == 50_000
+        assert cfg.resolve_threshold("mcp_x_y") == 20_000
 
     def test_scaled_small_window_caps_mcp_threshold(self, tmp_path, monkeypatch):
         """A tiny model's scaled default_result_size caps even the MCP value."""
@@ -238,3 +238,27 @@ class TestMcpPrefixThreshold:
         cfg = budget_for_context_window(16_384)  # scaled default < 50K
         assert cfg.default_result_size < 50_000
         assert cfg.resolve_threshold("mcp_tool") == cfg.default_result_size
+
+
+class TestInspectionSafeToolBudgets:
+    def test_large_output_tools_have_bounded_defaults(self):
+        assert DEFAULT_BUDGET.resolve_threshold("vision_analyze") == 12_000
+        assert DEFAULT_BUDGET.resolve_threshold("browser_exec") == 20_000
+        assert DEFAULT_BUDGET.resolve_threshold("session_search") == 16_000
+        assert DEFAULT_BUDGET.resolve_threshold("hindsight_recall") == 16_000
+        assert DEFAULT_BUDGET.resolve_threshold("web_extract") == 20_000
+
+    def test_per_tool_config_override(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "tool_budget:\n  per_tool_result_size_chars:\n    vision_analyze: 7000\n    browser_exec: 9000\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = budget_for_context_window(None)
+        assert cfg.resolve_threshold("vision_analyze") == 7_000
+        assert cfg.resolve_threshold("browser_exec") == 9_000
+        # Unspecified inspection-sensitive tools retain their safe default.
+        assert cfg.resolve_threshold("session_search") == 16_000
+
+    def test_configured_override_is_still_context_capped(self):
+        cfg = BudgetConfig(default_result_size=8_000, tool_overrides={"vision_analyze": 50_000})
+        assert cfg.resolve_threshold("vision_analyze") == 8_000

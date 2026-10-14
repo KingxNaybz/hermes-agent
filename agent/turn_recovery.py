@@ -907,6 +907,7 @@ def _welcome_outage_copy(base_url: Any, classified: Any, *, anonymous: bool = Fa
 # Terminal status label per non-retryable reason (default names the HTTP status).
 _NONRETRYABLE_LABELS = {
     FailoverReason.content_policy_blocked: "The provider's safety filter refused this request",
+    FailoverReason.content_rejected: "The provider's content inspection rejected this request",
     FailoverReason.upstream_blocked: "A firewall/CDN in front of the provider blocked this request",
     FailoverReason.ssl_cert_verification: "The provider's security certificate could not be verified",
     # Only reached after the one-shot image shrink ran (recover_after_classification sets the flag first).

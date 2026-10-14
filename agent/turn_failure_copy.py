@@ -228,6 +228,7 @@ FAILURE_CAUSE_GLOSS: Dict[str, str] = {
     FailoverReason.upstream_blocked.value: "a firewall/CDN in front of the AI model service blocked the request",
     FailoverReason.model_not_found.value: "the model {subject} uses was not found at the AI model service",
     FailoverReason.content_policy_blocked.value: "the AI model service's safety filter rejected the request",
+    FailoverReason.content_rejected.value: "the AI model service's content inspection rejected the request",
     "context_overflow": "{possessive} request grew too large for the model",
     "payload_too_large": "{possessive} request grew too large for the model",
 }

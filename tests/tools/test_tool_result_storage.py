@@ -550,3 +550,20 @@ class TestRecoveryHint:
         assert msg.startswith(PERSISTED_OUTPUT_TAG)
         assert msg.endswith(PERSISTED_OUTPUT_CLOSING_TAG)
         assert "read_file" in msg
+
+
+def test_vision_sized_result_spills_raw_artifact_and_bounds_model_context(tmp_path, monkeypatch):
+    """Regression for Qwen DataInspectionFailed after a 26,303-char vision result."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    prefix = "inspection-sensitive vision output\n"
+    raw = prefix + ("v" * (26_303 - len(prefix)))
+    bounded = maybe_persist_tool_result(
+        content=raw, tool_name="vision_analyze", tool_use_id="vision_26303",
+        env=None, config=BudgetConfig(),
+    )
+    assert len(raw) == 26_303  # exact result size from the Qwen failure sequence
+    assert PERSISTED_OUTPUT_TAG in bounded
+    assert len(bounded) < 3_000
+    artifact = tmp_path / "cache" / "spillover" / "vision_26303.txt"
+    assert artifact.read_text() == raw
+    assert raw not in bounded
