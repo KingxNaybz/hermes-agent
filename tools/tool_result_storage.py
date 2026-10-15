@@ -350,9 +350,19 @@ def _compact_history_result(content: str, tool_use_id: str, env, config: BudgetC
     """
     if HISTORY_COMPACT_TAG in content:
         return None
+
+    # Layer-4 negative-compaction guard (L5 work, 2026-10): a replacement is only
+    # acceptable when it is STRICTLY SMALLER than the model-visible content it replaces.
+    # Tiny results (observed: 148/258/521 chars) must never inflate into ~405-char
+    # artifact references just to satisfy the historical-result budget.
+    def _smaller(candidate):
+        if candidate is None:
+            return None
+        return candidate if len(candidate) < len(content) else None
+
     existing_path = extract_persisted_path(content)
     if existing_path is not None:
-        return _build_history_compact_message(len(content), existing_path)
+        return _smaller(_build_history_compact_message(len(content), existing_path))
     persisted = maybe_persist_tool_result(
         content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
         env=env, config=config, threshold=0)
@@ -360,8 +370,8 @@ def _compact_history_result(content: str, tool_use_id: str, env, config: BudgetC
         return None
     path = extract_persisted_path(persisted)
     if path is not None:
-        return _build_history_compact_message(len(content), path)
-    return persisted  # inline-truncation fallback (no writable artifact location)
+        return _smaller(_build_history_compact_message(len(content), path))
+    return _smaller(persisted)  # inline-truncation fallback (no writable artifact location)
 
 
 def _shrink_history_stub(content: str) -> str | None:
