@@ -10,6 +10,20 @@ import pytest
 #pytestmark = pytest.mark.skip(reason="Hangs in non-interactive environments")
 
 
+@pytest.fixture(autouse=True)
+def _disable_layer5_whole_request_gate(monkeypatch):
+    """These tests exercise Layer-4 preflight compression against the default
+    256K context. The Layer-5 whole-request gate has its own dedicated suite
+    (test_turn_whole_request_budget.py) and a deliberately tighter operational
+    envelope; disable it here so preflight-compression assertions observe the
+    behavior they were written for."""
+    import agent.turn_whole_request_budget as l5
+    monkeypatch.setattr(
+        l5, "get_whole_request_budget",
+        lambda: (245_760, 229_376, 262_144, 1_024, 3, False),
+    )
+
+
 
 from types import SimpleNamespace
 from typing import Any

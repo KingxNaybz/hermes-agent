@@ -48,6 +48,41 @@ DEFAULT_TOOL_RESULT_LIMITS: Dict[str, int] = {
 # MCP servers frequently return unpaginated payloads.  Keep raw output as an artifact,
 # but do not carry more than this in every subsequent inference request.
 DEFAULT_MCP_RESULT_SIZE_CHARS: int = 20_000
+
+# ---------------------------------------------------------------------------
+# Layer 5 -- whole-request budget gate (added 2026-10)
+#
+# Layer 4 governs ONE category (historical tool results).  The Qwen
+# DataInspectionFailed at call #97 of session 20261014_050232_ca77b358 proved
+# the aggregate request -- system prompt, user/assistant text, reasoning,
+# tool-call arguments, summaries, schemas, results -- can grow past safe
+# limits while every individual category stays compliant.  Layer 5 is the
+# authoritative whole-request gate evaluated at final request assembly,
+# immediately before provider dispatch.  Layer 4 remains a specialized
+# optimization underneath it.
+#
+# Budget model (all model-visible tokens, measured with estimate_tokens):
+#   provider_context_limit   = 262,144  (Alibaba/Qwen long-context ceiling)
+#   reserved_output          =  32,768  (completion + reasoning headroom)
+#   safety_margin            =  32,768
+#   whole_request_budget     = 196,608  (working limit sent to provider)
+#   reclamation_trigger      = 176,947  (90% of budget: start reclaiming)
+#   hard_refusal             = 245,760  (still above after reclamation -> refuse)
+#
+# Config block (optional overrides, same style as tool_budget)::
+#
+#   whole_request_budget:
+#     budget_tokens: 196608
+#     trigger_tokens: 176947
+#     hard_refusal_tokens: 245760
+#     min_reclaim_tokens: 256
+#     max_passes: 3
+#     enabled: true
+DEFAULT_WHOLE_REQUEST_BUDGET_TOKENS: int = 48_000
+DEFAULT_WHOLE_REQUEST_TRIGGER_TOKENS: int = 40_000
+DEFAULT_WHOLE_REQUEST_HARD_REFUSAL_TOKENS: int = 56_000
+DEFAULT_WHOLE_REQUEST_MIN_RECLAIM_TOKENS: int = 1_000
+DEFAULT_WHOLE_REQUEST_MAX_PASSES: int = 3
 MCP_TOOL_PREFIX: str = "mcp_"
 
 
@@ -187,3 +222,52 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
         history_budget=history_budget,
         history_recent_protect=history_protect,
     )
+
+
+def _bool_value(value, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def get_whole_request_budget() -> tuple[int, int, int, int, int, bool]:
+    """Load Layer-5 whole-request budget settings.
+
+    Returns ``(budget, trigger, hard_refusal, min_reclaim, max_passes, enabled)``.
+
+    Overrides come from an optional ``whole_request_budget`` config block in
+    the same style as ``tool_budget``.  Invalid entries fall back to the safe
+    defaults.  Values are self-healed so ``trigger < budget < hard_refusal``
+    always holds even with a misconfigured block.
+    """
+    budget = DEFAULT_WHOLE_REQUEST_BUDGET_TOKENS
+    trigger = DEFAULT_WHOLE_REQUEST_TRIGGER_TOKENS
+    hard_refusal = DEFAULT_WHOLE_REQUEST_HARD_REFUSAL_TOKENS
+    min_reclaim = DEFAULT_WHOLE_REQUEST_MIN_RECLAIM_TOKENS
+    max_passes = DEFAULT_WHOLE_REQUEST_MAX_PASSES
+    enabled = True
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        data = load_config_readonly()
+        block = data.get("whole_request_budget") if isinstance(data, dict) else None
+        if isinstance(block, dict):
+            budget = _positive_int(block.get("budget_tokens"), budget)
+            trigger = _positive_int(block.get("trigger_tokens"), trigger)
+            hard_refusal = _positive_int(block.get("hard_refusal_tokens"), hard_refusal)
+            min_reclaim = _positive_int(block.get("min_reclaim_tokens"), min_reclaim)
+            max_passes = _positive_int(block.get("max_passes"), max_passes)
+            enabled = _bool_value(block.get("enabled"), enabled)
+    except Exception:
+        pass
+
+    # Self-healing invariants: trigger below budget; refusal above budget.
+    if trigger >= budget:
+        trigger = int(budget * 0.90)
+    if hard_refusal < budget:
+        hard_refusal = budget + max(1, int(budget * 0.25))
+    max_passes = max(1, min(max_passes, 8))
+
+    return budget, trigger, hard_refusal, min_reclaim, max_passes, enabled

@@ -51,6 +51,7 @@ from agent.turn_iteration_prep import (
 )
 from agent.turn_loop_errors import handle_outer_loop_error
 from agent.turn_preflight_gate import run_preflight_gate
+from agent.turn_whole_request_budget import run_whole_request_budget
 from agent.turn_request_assembly import assemble_api_request
 from agent.turn_response_check import check_api_response
 from agent.turn_response_intake import normalize_model_response
@@ -1543,6 +1544,15 @@ def _run_conversation_turn(
         if _pg.action == "break":
             break
         if _pg.action == "continue":
+            continue
+        # Layer 5: authoritative whole-request budget gate on the actual
+        # provider-bound request (after assembly+preflight, before announce/dispatch).
+        _l5g = _run_phase(run_whole_request_budget, agent, s)
+        if _l5g.action == "return":
+            return _l5g.result
+        if _l5g.action == "break":
+            break
+        if _l5g.action == "continue":
             continue
         _run_phase(announce_api_call, agent, s)
 
